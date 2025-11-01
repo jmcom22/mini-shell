@@ -1,7 +1,5 @@
 /*
-En este paso solo se hace la lectura de comandos externos
-(sin ejecución) y también se implementan los comandos
-integrados de cd y exit
+En este paso ahora se ejecutan los comandos externos en foreground
 */
 
 /*
@@ -18,6 +16,8 @@ el manejo avanzado de señales.
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #define MAX_LINE 1024
 #define MAX_ARGS 64 
@@ -133,10 +133,50 @@ int main(void)
             continue;
         }
 
-        // Por ahora no se ejecutan comandos externos
-        printf("Comando recibido (no ejecutado aún):");
-        for (int i = 0; i < argc; ++i) printf(" '%s'", argv[i]);
-        printf("\n");
+        // Ahora se ejecutan comandos (por ahora solo en foreground)
+        pid_t pid = fork();
+        if (pid<0)
+        {
+            perr("fork");
+            continue;
+        }
+        else if (pid==0) // Hijo es que ejecuta el comando
+        {
+            if (signal(SIGINT, SIG_DFL) == SIG_ERR){}
+
+            execvp(argv[0], argv);
+            perr("falló exec"); // Si execvp retorna, es porque hubo error
+            _exit(EXIT_FAILURE);
+        }
+        else // El padre espera a que termine el hijo
+        {
+            int status;
+            pid_t w;
+            do
+            {
+                w = waitpid(pid, &status, 0);
+            } while (w==-1 && errno==EINTR);
+            
+            if (w==-1)
+            {
+                perr("waitpid");
+            }
+            else
+            {
+                if (WIFEXITED(status)) // Si terminó normalmente
+                {
+                    printf("El proceso foreground de PID %d termino con exit code %d\n", (int)pid, WEXITSTATUS(status));
+                }
+                else if (WIFSIGNALED(status)) // Si terminó por una señal
+                {
+                    printf("El proceso foreground de PID %d termino con signal %d\n", (int)pid, WTERMSIG(status));
+                }
+                else
+                {
+                    printf("El proceso foreground de PID %d termino (status %d)\n", (int)pid, status);
+                }
+            }
+        }
     }
 
     return 0;
