@@ -161,6 +161,11 @@ int main(void)
     char *argv[MAX_ARGS];
     char *home = getenv("HOME"); //path al home
 
+    // Esto para que cuando se compile con SIGNALDETECTION, se empiece a enviar el SIGCHLD cuando el padre esté escuchando
+    sigset_t block_mask, prev_mask;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGCHLD);
+
     // Para evitar el ctrl-c mate al shell (porque solo se puede salir con exit)
     if (signal(SIGINT, SIG_IGN) == SIG_ERR)
     {
@@ -304,18 +309,32 @@ int main(void)
             if (getrusage(RUSAGE_CHILDREN, &ru_before) == -1) perr("getrusage");
         }
 
+        // Bloquear SIGCHLD PARA EVITAR RACE con el handler
+        if (sigprocmask(SIG_BLOCK, &block_mask, &prev_mask) == -1)
+        {
+            perr("sigprocmask BLOCK");
+        }
+
         pid_t pid = fork();
         if (pid<0)
         {
             perr("fork");
+            if (sigprocmask(SIG_SETMASK, &prev_mask, NULL) == -1) perr("sigprocmask RESTORE");
             continue;
         }
         else if (pid==0) // Hijo es que ejecuta el comando
         {
-            if (signal(SIGINT, SIG_DFL) == SIG_ERR){} //Se restaura el poder usar ctrl-c para el proceso hijo (se había deshabilitado para el shell, siendo que solo se puede salir con exit)
+            // Restaurar la máscara de señales en el hijo: así el hijo recibe SIGCHLD/SIGINT normalmente 
+            if (sigprocmask(SIG_SETMASK, &prev_mask, NULL) == -1)
+            {
+                perr("child sigprocmask RESTORE");
+                _exit(EXIT_FAILURE);
+            }
 
             // Por seguridad, se hace un nuevo grupo de procesos de manera que los procesos background no capturen señales dirigidas a los procesos foreground
             if (background) setpgid(0,0);
+
+            if (signal(SIGINT, SIG_DFL) == SIG_ERR){} //Se restaura el poder usar ctrl-c para el proceso hijo (se había deshabilitado para el shell, siendo que solo se puede salir con exit)
 
             execvp(argv[0], argv);
             perr("falló exec"); // Si execvp retorna, es porque hubo error
@@ -323,6 +342,11 @@ int main(void)
         }
         else // Proceso padre, cambia un poco con soporte a los procesos en background
         {
+            // Restaurar máscara en el padre: ahora el handler puede ejecutarse si hubo SIGCHLD 
+            if (sigprocmask(SIG_SETMASK, &prev_mask, NULL) == -1) {
+                perr("sigprocmask RESTORE");
+            }
+
             if (background) //Si es background no se bloquea (no espera a que termine)
             {
                 printf("Se inicio un proceso background con PID %d\n", (int)pid);
