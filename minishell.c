@@ -1,5 +1,13 @@
 /*
-En este paso ahora se ejecutan los comandos externos en foreground
+Ahora se ejecutan procesos en background y se recolectan hijos
+de dos maneras, a través de sondeo y de manejador de señal (para
+lo cual se tiene que compilar con -DSIGNALDETECTION)
+
+Ejemplo de compilación para la recolección de hijos con sondeo:
+gcc minishell.c
+
+Ejemplo de compilación para la recolección de hijos con señales:
+gcc -DSIGNALDETECTION minishell.c
 */
 
 /*
@@ -18,6 +26,7 @@ el manejo avanzado de señales.
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <stdint.h>
 
 #define MAX_LINE 1024
 #define MAX_ARGS 64 
@@ -36,6 +45,122 @@ static void trim(char *s)
     while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t')) s[--len] = '\0';
 }
 
+/*
+Función para convertir números enteros a un string en formato
+decimal, es imprescindible para convertir enteros (como el PID
+y el estado) a una cadena decimal de forma async-signal-safe,
+permitiendo que el manejador de la señal SIGCHLD reporte la
+terminación de los procesos en background sin usar funciones
+inseguras como sprintf
+*/
+static int int_to_dec_str(int num, char *buf, size_t bufsize)
+{
+    if (bufsize==0) return 0;
+    if (num==0)
+    {
+        if (bufsize<2) return 0;
+        buf[0] = '0';
+        buf[1] = '\0';
+        return 1;
+    }
+
+    unsigned int n = (unsigned int)(num<0? -num : num);
+    char tmp[32];
+    int i = 0;
+    while (n && i<(int)sizeof(tmp))
+    {
+        tmp[i++] = '0' + (n%10);
+        n/=10;
+    }
+
+    int p = 0;
+    if (num<0)
+    {
+        if (p+1>=(int)bufsize) return 0;
+        buf[p++]='-';
+    }
+    while (i>0)
+    {
+        if (p+1>=(int)bufsize) return 0;
+        buf[p++] = tmp[i--];
+    }
+    if (p>=(int)bufsize) return 0;
+    buf[p] = '\0';
+    return p;
+}
+
+#ifdef SIGNALDETECTION
+// Manejador de SIGCHLD
+static void sigchld_handler(int sig)
+{
+    (void)sig;
+    int saved_errno = errno;
+    pid_t pid;
+    int status;
+
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+    {
+        char buf[200];
+        const char *pre = "Proceso en background con PID ";
+        const char *mid = " termino (status ";
+        const char *post = ")\n";
+        size_t off = 0;
+
+        size_t lpre = strlen(pre);
+        if (off + lpre < sizeof(buf))
+        {
+            memcpy(buf + off, pre, lpre);
+            off += lpre;
+        }
+
+        char numbuf[32];
+        int n = int_to_dec_str((int)pid, numbuf, sizeof(numbuf));
+        if (n > 0 && off + (size_t)n < sizeof(buf))
+        {
+            memcpy(buf + off, numbuf, (size_t)n);
+            off += (size_t)n;
+        }
+
+        size_t lmid = strlen(mid);
+        if (off + lmid < sizeof(buf))
+        {
+            memcpy(buf + off, mid, lmid);
+            off += lmid;
+        }
+
+        n = int_to_dec_str(status, numbuf, sizeof(numbuf));
+        if (n > 0 && off + (size_t)n < sizeof(buf))
+        {
+            memcpy(buf + off, numbuf, (size_t)n);
+            off += (size_t)n;
+        }
+
+        size_t lpost = strlen(post);
+        if (off + lpost < sizeof(buf))
+        {
+            memcpy(buf + off, post, lpost);
+            off += lpost;
+        }
+
+        /* write es async-signal-safe */
+        ssize_t wr = write(STDOUT_FILENO, buf, off);
+        (void)wr;
+    }
+    errno = saved_errno;
+}
+#endif
+
+//Función para revisión por sondeo
+static void reap_background_polling(void)
+{
+    pid_t pid;
+    int status;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+    {
+        printf("Proceso en background con PID %d termino (status %d)\n", (int)pid, status);
+    }
+}
+
 int main(void)
 {
     char line[MAX_LINE];  // Línea de comando
@@ -48,8 +173,27 @@ int main(void)
         perr("signal(SIGINT)");
     }
 
+#ifdef SIGNALDETECTION
+    //Se instala el SIGCHLD handler
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigchld_handler;
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGCHLD, &sa, NULL) == -1)
+    {
+        perr("sigaction(SIGCHLD)");
+    }
+#endif
+
     while (1)
     {
+
+#ifndef SIGNALDETECTION
+        // Si no se declara que la búsqueda de hijos se hará por señales, entonces se hace por sondeo
+        reap_background_polling();
+#endif
+
         printf("mini-shell$ "); //Cambiar esto luego para que se muestre el directorio
         fflush(stdout);
 
@@ -83,6 +227,21 @@ int main(void)
         {
             fprintf(stderr, "Input demasiado largo (max %d caracteres)\n", MAX_LINE-2);
             continue;
+        }
+
+        //Detectar si está el marcador & para que el proceso se haga en el backgroudn
+        int background = 0;
+        size_t l = strlen(line);
+        if (l>0)
+        {
+            size_t i = l;
+            while (i > 0 && (line[i-1] == ' ' || line[i-1] == '\t')) i--; //Esto para obtener el último caracter que no sea un espacio
+            if (i > 0 && line[i-1] == '&') {
+                background = 1;
+                // Se remueve & y espacios que queden
+                line[i-1] = '\0';
+                trim(line);
+            }
         }
 
         // Tokenizar (espacios/tabs) para luego pasar a execvp
@@ -142,38 +301,48 @@ int main(void)
         }
         else if (pid==0) // Hijo es que ejecuta el comando
         {
-            if (signal(SIGINT, SIG_DFL) == SIG_ERR){}
+            if (signal(SIGINT, SIG_DFL) == SIG_ERR){} //Se restaura el poder usar ctrl-c para el proceso hijo (se había deshabilitado para el shell, siendo que solo se puede salir con exit)
+
+            // Por seguridad, se hace un nuevo grupo de procesos de manera que los procesos background no capturen señales dirigidas a los procesos foreground
+            if (background) setpgid(0,0);
 
             execvp(argv[0], argv);
             perr("falló exec"); // Si execvp retorna, es porque hubo error
             _exit(EXIT_FAILURE);
         }
-        else // El padre espera a que termine el hijo
+        else // Proceso padre, cambia un poco con soporte a los procesos en background
         {
-            int status;
-            pid_t w;
-            do
+            if (background) //Si es background no se bloquea (no espera a que termine)
             {
-                w = waitpid(pid, &status, 0);
-            } while (w==-1 && errno==EINTR);
-            
-            if (w==-1)
-            {
-                perr("waitpid");
+                printf("Se inicio un proceso background con PID %d\n", (int)pid);
             }
-            else
+            else // Si es foreground, el shell se queda esperando a que termine
             {
-                if (WIFEXITED(status)) // Si terminó normalmente
+                int status;
+                pid_t w;
+                do
                 {
-                    printf("El proceso foreground de PID %d termino con exit code %d\n", (int)pid, WEXITSTATUS(status));
-                }
-                else if (WIFSIGNALED(status)) // Si terminó por una señal
+                    w = waitpid(pid, &status, 0);
+                } while (w==-1 && errno==EINTR);
+                
+                if (w==-1)
                 {
-                    printf("El proceso foreground de PID %d termino con signal %d\n", (int)pid, WTERMSIG(status));
+                    perr("waitpid");
                 }
                 else
                 {
-                    printf("El proceso foreground de PID %d termino (status %d)\n", (int)pid, status);
+                    if (WIFEXITED(status)) // Si terminó normalmente
+                    {
+                        printf("El proceso foreground de PID %d termino con exit code %d\n", (int)pid, WEXITSTATUS(status));
+                    }
+                    else if (WIFSIGNALED(status)) // Si terminó por una señal
+                    {
+                        printf("El proceso foreground de PID %d termino con signal %d\n", (int)pid, WTERMSIG(status));
+                    }
+                    else
+                    {
+                        printf("El proceso foreground de PID %d termino (status %d)\n", (int)pid, status);
+                    }
                 }
             }
         }
