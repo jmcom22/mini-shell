@@ -256,7 +256,7 @@ int main(void)
             int status;
             while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
             {
-                printf("Reaped child %d (status %d)\n", (int)pid, status);
+                printf("Hijo reaped %d (status %d)\n", (int)pid, status);
             }
             break;
         }
