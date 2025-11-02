@@ -1,13 +1,5 @@
 /*
-Ahora se ejecutan procesos en background y se recolectan hijos
-de dos maneras, a través de sondeo y de manejador de señal (para
-lo cual se tiene que compilar con -DSIGNALDETECTION)
-
-Ejemplo de compilación para la recolección de hijos con sondeo:
-gcc minishell.c
-
-Ejemplo de compilación para la recolección de hijos con señales:
-gcc -DSIGNALDETECTION minishell.c
+Ahora en este paso se implementan las estadísticas
 */
 
 /*
@@ -27,6 +19,8 @@ el manejo avanzado de señales.
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <stdint.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 
 #define MAX_LINE 1024
 #define MAX_ARGS 64 
@@ -259,6 +253,13 @@ int main(void)
         // Builtins (exit y cd)
         if (strcmp(argv[0], "exit") == 0)
         {
+            //Esperar por todos los proces pendientes
+            pid_t pid;
+            int status;
+            while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+            {
+                printf("Reaped child %d (status %d)\n", (int)pid, status);
+            }
             break;
         }
         if (strcmp(argv[0], "cd") == 0)
@@ -292,7 +293,17 @@ int main(void)
             continue;
         }
 
-        // Ahora se ejecutan comandos (por ahora solo en foreground)
+        // Ahora se ejecutan comandos
+
+        //datos para las estadísticas de los procesos foreground
+        struct timeval tstart, tend;
+        struct rusage ru_before, ru_after;
+        if (!background)
+        {
+            if (gettimeofday(&tstart, NULL) == -1) perr("gettimeofday");
+            if (getrusage(RUSAGE_CHILDREN, &ru_before) == -1) perr("getrusage");
+        }
+
         pid_t pid = fork();
         if (pid<0)
         {
@@ -343,6 +354,19 @@ int main(void)
                     {
                         printf("El proceso foreground de PID %d termino (status %d)\n", (int)pid, status);
                     }
+
+                    if (gettimeofday(&tend, NULL) == -1) perr("gettimeofday");
+                    if (getrusage(RUSAGE_CHILDREN, &ru_after) == -1) perr("getrusage");
+
+                    double wall = (tend.tv_sec - tstart.tv_sec) + (tend.tv_usec - tstart.tv_usec)/1e6;
+                    double u_before = ru_before.ru_utime.tv_sec + ru_before.ru_utime.tv_usec/1e6;
+                    double s_before = ru_before.ru_stime.tv_sec + ru_before.ru_stime.tv_usec/1e6;
+                    double u_after  = ru_after.ru_utime.tv_sec + ru_after.ru_utime.tv_usec/1e6;
+                    double s_after  = ru_after.ru_stime.tv_sec + ru_after.ru_stime.tv_usec/1e6;
+                    double u = u_after - u_before;
+                    double s = s_after - s_before;
+
+                    printf("Tiempos: wall=%.6f s, user=%.6f s, sys=%.6f s\n", wall, u, s);
                 }
             }
         }
