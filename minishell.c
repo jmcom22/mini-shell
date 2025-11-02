@@ -49,94 +49,87 @@ inseguras como sprintf
 */
 static int int_to_dec_str(int num, char *buf, size_t bufsize)
 {
-    if (bufsize==0) return 0;
-    if (num==0)
-    {
-        if (bufsize<2) return 0;
+    if (bufsize == 0) return 0;
+    if (num == 0) {
+        if (bufsize < 2) return 0;
         buf[0] = '0';
         buf[1] = '\0';
         return 1;
     }
 
-    unsigned int n = (unsigned int)(num<0? -num : num);
+    unsigned int n = (unsigned int)(num < 0 ? - (long)num : num);
     char tmp[32];
     int i = 0;
-    while (n && i<(int)sizeof(tmp))
-    {
-        tmp[i++] = '0' + (n%10);
-        n/=10;
+    while (n && i < (int)sizeof(tmp)) {
+        tmp[i++] = '0' + (n % 10);
+        n /= 10;
     }
 
     int p = 0;
-    if (num<0)
-    {
-        if (p+1>=(int)bufsize) return 0;
-        buf[p++]='-';
+    if (num < 0) {
+        if (p + 1 >= (int)bufsize) return 0;
+        buf[p++] = '-';
     }
-    while (i>0)
-    {
-        if (p+1>=(int)bufsize) return 0;
-        buf[p++] = tmp[i--];
+
+    // tmp[0..i-1] tiene los dígitos en orden inverso; copiar en orden correcto:
+    for (int j = i - 1; j >= 0; --j) {
+        if (p + 1 >= (int)bufsize) return 0;
+        buf[p++] = tmp[j];
     }
-    if (p>=(int)bufsize) return 0;
+    if (p >= (int)bufsize) return 0;
     buf[p] = '\0';
     return p;
 }
 
+
 #ifdef SIGNALDETECTION
-// Manejador de SIGCHLD
 static void sigchld_handler(int sig)
 {
     (void)sig;
     int saved_errno = errno;
     pid_t pid;
     int status;
+    const char pre[] = "Proceso en background con PID ";
+    const char mid[] = " termino (status ";
+    const char post[] = ")\n";
 
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
     {
         char buf[200];
-        const char *pre = "Proceso en background con PID ";
-        const char *mid = " termino (status ";
-        const char *post = ")\n";
         size_t off = 0;
 
-        size_t lpre = strlen(pre);
-        if (off + lpre < sizeof(buf))
-        {
-            memcpy(buf + off, pre, lpre);
-            off += lpre;
+        // copiar pre (sin usar strlen)
+        size_t lpre = sizeof(pre) - 1;
+        if (off + lpre < sizeof(buf)) {
+            for (size_t k = 0; k < lpre; ++k) buf[off++] = pre[k];
         }
 
+        // PID como string
         char numbuf[32];
         int n = int_to_dec_str((int)pid, numbuf, sizeof(numbuf));
-        if (n > 0 && off + (size_t)n < sizeof(buf))
-        {
-            memcpy(buf + off, numbuf, (size_t)n);
-            off += (size_t)n;
+        if (n > 0 && off + (size_t)n < sizeof(buf)) {
+            for (int k = 0; k < n; ++k) buf[off++] = numbuf[k];
         }
 
-        size_t lmid = strlen(mid);
-        if (off + lmid < sizeof(buf))
-        {
-            memcpy(buf + off, mid, lmid);
-            off += lmid;
+        // mid
+        size_t lmid = sizeof(mid) - 1;
+        if (off + lmid < sizeof(buf)) {
+            for (size_t k = 0; k < lmid; ++k) buf[off++] = mid[k];
         }
 
+        // status
         n = int_to_dec_str(status, numbuf, sizeof(numbuf));
-        if (n > 0 && off + (size_t)n < sizeof(buf))
-        {
-            memcpy(buf + off, numbuf, (size_t)n);
-            off += (size_t)n;
+        if (n > 0 && off + (size_t)n < sizeof(buf)) {
+            for (int k = 0; k < n; ++k) buf[off++] = numbuf[k];
         }
 
-        size_t lpost = strlen(post);
-        if (off + lpost < sizeof(buf))
-        {
-            memcpy(buf + off, post, lpost);
-            off += lpost;
+        // post
+        size_t lpost = sizeof(post) - 1;
+        if (off + lpost < sizeof(buf)) {
+            for (size_t k = 0; k < lpost; ++k) buf[off++] = post[k];
         }
 
-        /* write es async-signal-safe */
+        // write es async-signal-safe
         ssize_t wr = write(STDOUT_FILENO, buf, off);
         (void)wr;
     }
@@ -303,16 +296,17 @@ int main(void)
         //datos para las estadísticas de los procesos foreground
         struct timeval tstart, tend;
         struct rusage ru_before, ru_after;
-        if (!background)
-        {
-            if (gettimeofday(&tstart, NULL) == -1) perr("gettimeofday");
-            if (getrusage(RUSAGE_CHILDREN, &ru_before) == -1) perr("getrusage");
-        }
 
         // Bloquear SIGCHLD PARA EVITAR RACE con el handler
         if (sigprocmask(SIG_BLOCK, &block_mask, &prev_mask) == -1)
         {
             perr("sigprocmask BLOCK");
+        }
+
+        if (!background)
+        {
+            if (gettimeofday(&tstart, NULL) == -1) perr("gettimeofday");
+            if (getrusage(RUSAGE_CHILDREN, &ru_before) == -1) perr("getrusage");
         }
 
         pid_t pid = fork();
