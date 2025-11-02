@@ -1,7 +1,5 @@
 /*
-En este paso solo se hace la lectura de comandos externos
-(sin ejecución) y también se implementan los comandos
-integrados de cd y exit
+Ahora en este paso se implementan las estadísticas
 */
 
 /*
@@ -18,6 +16,11 @@ el manejo avanzado de señales.
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <stdint.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 
 #define MAX_LINE 1024
 #define MAX_ARGS 64 
@@ -36,11 +39,125 @@ static void trim(char *s)
     while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t')) s[--len] = '\0';
 }
 
+/*
+Función para convertir números enteros a un string en formato
+decimal, es imprescindible para convertir enteros (como el PID
+y el estado) a una cadena decimal de forma async-signal-safe,
+permitiendo que el manejador de la señal SIGCHLD reporte la
+terminación de los procesos en background sin usar funciones
+inseguras como sprintf
+*/
+static int int_to_dec_str(int num, char *buf, size_t bufsize)
+{
+    if (bufsize == 0) return 0;
+    if (num == 0) {
+        if (bufsize < 2) return 0;
+        buf[0] = '0';
+        buf[1] = '\0';
+        return 1;
+    }
+
+    unsigned int n = (unsigned int)(num < 0 ? - (long)num : num);
+    char tmp[32];
+    int i = 0;
+    while (n && i < (int)sizeof(tmp)) {
+        tmp[i++] = '0' + (n % 10);
+        n /= 10;
+    }
+
+    int p = 0;
+    if (num < 0) {
+        if (p + 1 >= (int)bufsize) return 0;
+        buf[p++] = '-';
+    }
+
+    // tmp[0..i-1] tiene los dígitos en orden inverso; copiar en orden correcto:
+    for (int j = i - 1; j >= 0; --j) {
+        if (p + 1 >= (int)bufsize) return 0;
+        buf[p++] = tmp[j];
+    }
+    if (p >= (int)bufsize) return 0;
+    buf[p] = '\0';
+    return p;
+}
+
+
+#ifdef SIGNALDETECTION
+static void sigchld_handler(int sig)
+{
+    (void)sig;
+    int saved_errno = errno;
+    pid_t pid;
+    int status;
+    const char pre[] = "Proceso en background con PID ";
+    const char mid[] = " termino (status ";
+    const char post[] = ")\n";
+
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+    {
+        char buf[200];
+        size_t off = 0;
+
+        // copiar pre (sin usar strlen)
+        size_t lpre = sizeof(pre) - 1;
+        if (off + lpre < sizeof(buf)) {
+            for (size_t k = 0; k < lpre; ++k) buf[off++] = pre[k];
+        }
+
+        // PID como string
+        char numbuf[32];
+        int n = int_to_dec_str((int)pid, numbuf, sizeof(numbuf));
+        if (n > 0 && off + (size_t)n < sizeof(buf)) {
+            for (int k = 0; k < n; ++k) buf[off++] = numbuf[k];
+        }
+
+        // mid
+        size_t lmid = sizeof(mid) - 1;
+        if (off + lmid < sizeof(buf)) {
+            for (size_t k = 0; k < lmid; ++k) buf[off++] = mid[k];
+        }
+
+        // status
+        n = int_to_dec_str(status, numbuf, sizeof(numbuf));
+        if (n > 0 && off + (size_t)n < sizeof(buf)) {
+            for (int k = 0; k < n; ++k) buf[off++] = numbuf[k];
+        }
+
+        // post
+        size_t lpost = sizeof(post) - 1;
+        if (off + lpost < sizeof(buf)) {
+            for (size_t k = 0; k < lpost; ++k) buf[off++] = post[k];
+        }
+
+        // write es async-signal-safe
+        ssize_t wr = write(STDOUT_FILENO, buf, off);
+        (void)wr;
+    }
+    errno = saved_errno;
+}
+#endif
+
+//Función para revisión por sondeo
+static void reap_background_polling(void)
+{
+    pid_t pid;
+    int status;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+    {
+        printf("Proceso en background con PID %d termino (status %d)\n", (int)pid, status);
+    }
+}
+
 int main(void)
 {
     char line[MAX_LINE];  // Línea de comando
     char *argv[MAX_ARGS];
     char *home = getenv("HOME"); //path al home
+
+    // Esto para que cuando se compile con SIGNALDETECTION, se empiece a enviar el SIGCHLD cuando el padre esté escuchando
+    sigset_t block_mask, prev_mask;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGCHLD);
 
     // Para evitar el ctrl-c mate al shell (porque solo se puede salir con exit)
     if (signal(SIGINT, SIG_IGN) == SIG_ERR)
@@ -48,8 +165,27 @@ int main(void)
         perr("signal(SIGINT)");
     }
 
+#ifdef SIGNALDETECTION
+    //Se instala el SIGCHLD handler
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigchld_handler;
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGCHLD, &sa, NULL) == -1)
+    {
+        perr("sigaction(SIGCHLD)");
+    }
+#endif
+
     while (1)
     {
+
+#ifndef SIGNALDETECTION
+        // Si no se declara que la búsqueda de hijos se hará por señales, entonces se hace por sondeo
+        reap_background_polling();
+#endif
+
         printf("mini-shell$ "); //Cambiar esto luego para que se muestre el directorio
         fflush(stdout);
 
@@ -85,6 +221,21 @@ int main(void)
             continue;
         }
 
+        //Detectar si está el marcador & para que el proceso se haga en el backgroudn
+        int background = 0;
+        size_t l = strlen(line);
+        if (l>0)
+        {
+            size_t i = l;
+            while (i > 0 && (line[i-1] == ' ' || line[i-1] == '\t')) i--; //Esto para obtener el último caracter que no sea un espacio
+            if (i > 0 && line[i-1] == '&') {
+                background = 1;
+                // Se remueve & y espacios que queden
+                line[i-1] = '\0';
+                trim(line);
+            }
+        }
+
         // Tokenizar (espacios/tabs) para luego pasar a execvp
         int argc = 0;
         char *tok = strtok(line, " \t");
@@ -100,6 +251,13 @@ int main(void)
         // Builtins (exit y cd)
         if (strcmp(argv[0], "exit") == 0)
         {
+            //Esperar por todos los proces pendientes
+            pid_t pid;
+            int status;
+            while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+            {
+                printf("Reaped child %d (status %d)\n", (int)pid, status);
+            }
             break;
         }
         if (strcmp(argv[0], "cd") == 0)
@@ -133,10 +291,103 @@ int main(void)
             continue;
         }
 
-        // Por ahora no se ejecutan comandos externos
-        printf("Comando recibido (no ejecutado aún):");
-        for (int i = 0; i < argc; ++i) printf(" '%s'", argv[i]);
-        printf("\n");
+        // Ahora se ejecutan comandos
+
+        //datos para las estadísticas de los procesos foreground
+        struct timeval tstart, tend;
+        struct rusage ru_before, ru_after;
+
+        // Bloquear SIGCHLD PARA EVITAR RACE con el handler
+        if (sigprocmask(SIG_BLOCK, &block_mask, &prev_mask) == -1)
+        {
+            perr("sigprocmask BLOCK");
+        }
+
+        if (!background)
+        {
+            if (gettimeofday(&tstart, NULL) == -1) perr("gettimeofday");
+            if (getrusage(RUSAGE_CHILDREN, &ru_before) == -1) perr("getrusage");
+        }
+
+        pid_t pid = fork();
+        if (pid<0)
+        {
+            perr("fork");
+            if (sigprocmask(SIG_SETMASK, &prev_mask, NULL) == -1) perr("sigprocmask RESTORE");
+            continue;
+        }
+        else if (pid==0) // Hijo es que ejecuta el comando
+        {
+            // Restaurar la máscara de señales en el hijo: así el hijo recibe SIGCHLD/SIGINT normalmente 
+            if (sigprocmask(SIG_SETMASK, &prev_mask, NULL) == -1)
+            {
+                perr("child sigprocmask RESTORE");
+                _exit(EXIT_FAILURE);
+            }
+
+            // Por seguridad, se hace un nuevo grupo de procesos de manera que los procesos background no capturen señales dirigidas a los procesos foreground
+            if (background) setpgid(0,0);
+
+            if (signal(SIGINT, SIG_DFL) == SIG_ERR){} //Se restaura el poder usar ctrl-c para el proceso hijo (se había deshabilitado para el shell, siendo que solo se puede salir con exit)
+
+            execvp(argv[0], argv);
+            perr("falló exec"); // Si execvp retorna, es porque hubo error
+            _exit(EXIT_FAILURE);
+        }
+        else // Proceso padre, cambia un poco con soporte a los procesos en background
+        {
+            // Restaurar máscara en el padre: ahora el handler puede ejecutarse si hubo SIGCHLD 
+            if (sigprocmask(SIG_SETMASK, &prev_mask, NULL) == -1) {
+                perr("sigprocmask RESTORE");
+            }
+
+            if (background) //Si es background no se bloquea (no espera a que termine)
+            {
+                printf("Se inicio un proceso background con PID %d\n", (int)pid);
+            }
+            else // Si es foreground, el shell se queda esperando a que termine
+            {
+                int status;
+                pid_t w;
+                do
+                {
+                    w = waitpid(pid, &status, 0);
+                } while (w==-1 && errno==EINTR);
+                
+                if (w==-1)
+                {
+                    perr("waitpid");
+                }
+                else
+                {
+                    if (WIFEXITED(status)) // Si terminó normalmente
+                    {
+                        printf("El proceso foreground de PID %d termino con exit code %d\n", (int)pid, WEXITSTATUS(status));
+                    }
+                    else if (WIFSIGNALED(status)) // Si terminó por una señal
+                    {
+                        printf("El proceso foreground de PID %d termino con signal %d\n", (int)pid, WTERMSIG(status));
+                    }
+                    else
+                    {
+                        printf("El proceso foreground de PID %d termino (status %d)\n", (int)pid, status);
+                    }
+
+                    if (gettimeofday(&tend, NULL) == -1) perr("gettimeofday");
+                    if (getrusage(RUSAGE_CHILDREN, &ru_after) == -1) perr("getrusage");
+
+                    double wall = (tend.tv_sec - tstart.tv_sec) + (tend.tv_usec - tstart.tv_usec)/1e6;
+                    double u_before = ru_before.ru_utime.tv_sec + ru_before.ru_utime.tv_usec/1e6;
+                    double s_before = ru_before.ru_stime.tv_sec + ru_before.ru_stime.tv_usec/1e6;
+                    double u_after  = ru_after.ru_utime.tv_sec + ru_after.ru_utime.tv_usec/1e6;
+                    double s_after  = ru_after.ru_stime.tv_sec + ru_after.ru_stime.tv_usec/1e6;
+                    double u = u_after - u_before;
+                    double s = s_after - s_before;
+
+                    printf("Tiempos: wall=%.6f s, user=%.6f s, sys=%.6f s\n", wall, u, s);
+                }
+            }
+        }
     }
 
     return 0;
